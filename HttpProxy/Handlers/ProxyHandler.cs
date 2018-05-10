@@ -1,4 +1,7 @@
 ﻿using HttpProxy.Extensions;
+using Microsoft.Azure;
+using Microsoft.Azure.Storage;
+using Microsoft.Azure.CosmosDB.Table;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -7,6 +10,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Web;
+using System.Threading;
 
 namespace HttpProxy.Handlers
 {
@@ -17,27 +21,65 @@ namespace HttpProxy.Handlers
             //have to explicitly null it to avoid protocol violation
             if (request.Method == HttpMethod.Get || request.Method == HttpMethod.Trace) request.Content = null;
 
-            //now check if the request came from our secure listener then outgoing needs to be secure
-            if (request.Headers.Contains("X-Forward-Secure"))
-            {
-                request.RequestUri = new UriBuilder(request.RequestUri) { Scheme = Uri.UriSchemeHttps, Port = -1 }.Uri;
-                request.Headers.Remove("X-Forward-Secure");
-            }
+            var timeout = int.Parse(CloudConfigurationManager.GetSetting("timeout"));
+            var retryThreshold = int.Parse(CloudConfigurationManager.GetSetting("retryThreshold"));
+            var retryDelay = int.Parse(CloudConfigurationManager.GetSetting("retryDelay"));
+            var retryCount = 0;
+
             HttpClient client = new HttpClient();
             try
             {
-                AddProxyRequestHeader(request);
-                Trace.TraceInformation("Request To:{0}", request.RequestUri.ToString());
-                var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                while (retryCount < retryThreshold)
+                {
+                    if(retryCount > 0)
+                    {
+                        Thread.Sleep(TimeSpan.FromSeconds(retryDelay));
+                    }
 
-                AddProxyResponseHeader(response);
+                    AddProxyRequestHeader(request);
+                    Trace.TraceInformation("Request To:{0}", request.RequestUri.ToString());
 
-                if (request.Method == HttpMethod.Head)
-                    response.Content = null;
-                return response;
+                    client.Timeout = TimeSpan.FromSeconds(timeout);
+                    var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        AddProxyResponseHeader(response);
+
+                        if (request.Method == HttpMethod.Head)
+                            response.Content = null;
+                        return response;
+                    }
+                    else
+                    {
+                        switch (response.StatusCode.ToString())
+                        {
+                            case "408":
+                            case "503":
+                            case "504":
+                                {
+                                    retryCount++;
+                                    break;
+                                }
+                            default:
+                                {
+                                    await LogRequestAsync(response.StatusCode, request);
+                                    break;
+                                }
+                        }
+                    }
+
+                    if (retryCount >= retryThreshold)
+                    {
+                        return response;
+                    }
+                }
+
+                return null;
             }
             catch (Exception ex)
             {
+                await LogRequestAsync(HttpStatusCode.InternalServerError, request);
                 var response = request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex);
                 string message = ex.Message;
                 if (ex.InnerException != null)
@@ -46,6 +88,27 @@ namespace HttpProxy.Handlers
                 Trace.TraceError("Error:{0}", message);
                 return response;
             }
+        }
+        private async System.Threading.Tasks.Task LogRequestAsync(HttpStatusCode httpStatusCode, HttpRequestMessage request)
+        {
+            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(CloudConfigurationManager.GetSetting("httpproxylogs"));
+            CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
+
+            // Retrieve a reference to the table.
+            CloudTable table = tableClient.GetTableReference("requests");
+
+            // Create the table if it doesn't exist.
+            table.CreateIfNotExists();
+
+            LogMessage log = new LogMessage();
+            log.Method = request.Method.Method;
+            log.HttpContent = await request.Content.ReadAsByteArrayAsync();
+            log.StatusCode = httpStatusCode;
+            log.RequestUri = request.RequestUri;
+
+            TableOperation insertOperation = TableOperation.Insert(log);
+
+            table.Execute(insertOperation);
         }
 
         private static void AddProxyResponseHeader(HttpResponseMessage response)
@@ -56,6 +119,7 @@ namespace HttpProxy.Handlers
         private void AddProxyRequestHeader(HttpRequestMessage request)
         {
             request.Headers.Add("X-Forwarded-For", request.GetClientIp());
+            request.Headers.Add("user-agent", "HttpProxy");
         }
     }
 }
